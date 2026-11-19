@@ -1,0 +1,15 @@
+[project]
+name = "parametercontroller"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "frames-parser",
+    "pydantic>=2.11.7",
+    "sat-frames",
+]
+
+[tool.uv.sources]
+frames-parser = { git = "https://github.com/OAI-NSU/FramesParser" }
+sat-frames = { git = "https://github.com/OAI-NSU/SatFrames" }

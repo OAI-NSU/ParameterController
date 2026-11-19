@@ -4,7 +4,11 @@ from datetime import UTC, datetime
 from typing import Literal
 from uuid import UUID
 
+from frames_parser import frames_map, get_frame
 from pydantic import BaseModel, Field
+from sat_frames import frames_map_0x02
+
+frames_map[0x02].update(frames_map_0x02)
 
 
 def creation_time() -> datetime:
@@ -101,31 +105,51 @@ class SatModel(BaseModel):
     subsystems: dict[int, SubsystemState] = Field(default_factory=dict)
 
 
+def register_brk_parameters():
+    from sat_frames.GRIFON.BRK.frames.tmi0 import tmi0
+
+    # tmi0.subscribe([
+    #     ''
+    # ])
 
 class ParamController:
     def __init__(self) -> None:
         self.state: dict[int, SatModel] = {}
-        self.parse: Callable | None = None
 
-    def received_data(self, model: TMI_Model):
-        if not self.parse:
+    def on_received_data(self, model: TMI_Model):
+        frame, qualifier = get_frame(bytes.fromhex(model.raw_data), frames_map)
+        sat_id_val, sat_id_label = qualifier[1]
+        dev_id_val, dev_id_label = qualifier[2]
+        flag_val, _ = qualifier[3]
+        frame_type_val, frame_type_label = qualifier[4]
+        if flag_val == 1:
             return
-        sat_id: int = model.sat_id & 0x3FFF
-        sat: SatModel | None = self.state.get(sat_id)
-        if sat:
-            sat.last_user = model.username
-            sat.last_gs = model.gs_label
-            sat.last_session = model.timestamp
-            sat.sat_id = sat_id
-            dev_id = (model.loc_id & 0xF000) >> 8
-            frame_type = model.loc_id & 0x0F
-            subsystem = sat.subsystems.get(dev_id)
-            if subsystem:
-                self.parse(model.raw_data)
-                alarm_status = {}
-                tmi: TMI_Status = subsystem.tmi.setdefault(frame_type, TMI_Status(frame_type=frame_type))
-                subsystem.last_update = model.timestamp
-                tmi.add_tmi(model.raw_data, model.timestamp, alarm_status)
+        frame.parse(model.raw_data)
+        sat: SatModel | None = self.state.get(sat_id_val)
+        if not sat:
+            sat = SatModel(label=sat_id_label, sat_id=sat_id_val)
+            self.state[sat_id_val] = sat
+
+        sat.last_user = model.username
+        sat.last_gs = model.gs_label
+        sat.last_session = model.timestamp
+
+        subsystem = sat.subsystems.get(dev_id_val)
+        if not subsystem:
+            subsystem = SubsystemState(dev_id=dev_id_val, label=dev_id_label)
+        subsystem.last_update = model.timestamp
+
+        tmi = subsystem.tmi.get(frame_type_val)
+        if not tmi:
+            tmi = TMI_Status(frame_type=frame_type_val, name=frame_type_label)
+        tmi.add_tmi(model.raw_data, model.timestamp)
+
+
+        #         self.parse(model.raw_data)
+        #         alarm_status = {}
+        #         tmi: TMI_Status = subsystem.tmi.setdefault(frame_type, TMI_Status(frame_type=frame_type))
+        #         subsystem.last_update = model.timestamp
+        #         tmi.add_tmi(model.raw_data, model.timestamp, alarm_status)
 
 if __name__ == '__main__':
     ...

@@ -1,52 +1,14 @@
 from copy import deepcopy
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Literal
-from uuid import UUID
 
-from bytes_parser import BitField, BitFlag, Row
+from bytes_parser import BitField, BitFlag, Notification, Row
 from pydantic import BaseModel, Field
 
 
 def creation_time() -> datetime:
     return datetime.now().astimezone(UTC)
 
-
-
-class TMI_Model(BaseModel):
-    timestamp: datetime
-    session_id: UUID | None = None
-    username: str
-    sat_ip: str
-    rx_gs_ip: str = ''
-    gs_label: str = ''
-    gs_ip: str
-    loc_id: int
-    is_repeated: bool = False
-    raw_data: str
-    sat_az: float
-    sat_el: float
-    rot_az: float
-    rot_el: float
-    rot_time_offset: int = 0
-    lat: float = 0
-    lon: float = 0
-    alt: float = 0
-    distance_km: float = 0
-    tx_power: float = 0
-    is_beacon: bool = False
-    sat_rssi: float = 0
-    sat_snr: float = 0
-    rssi: float
-    mode: Literal['LoRa', 'FSK']
-    sf: int = 10
-    bw: int | float = 250
-    cr: int = 1
-    freq: int
-    dopler: float
-    snr: int
-    fei: float
-    sat_id: int
 
 class EventLevel(Enum):
     Error = 0
@@ -71,8 +33,9 @@ class EventsLog(BaseModel):
     pending: list[StatusEvent]
     processed: list[StatusEvent]
 
+
 class Qualifier(BaseModel):
-    value: int
+    # value: int
     sat_id: int
     dev_id: int
     frame_type: int
@@ -143,26 +106,44 @@ class AlarmCondition(BaseModel):
                     return True
             return False
 
+
 class TMI_Status(BaseModel):
-    frame_type: int
+    qualifier: Qualifier
     name: str
     hex_data: str = ''
-    alarm_condition: list[AlarmCondition] = Field(default_factory=list)
-    alarm: dict[str, AlarmCondition] = Field(default_factory=dict)
     last_update: datetime = Field(default_factory=creation_time)
-
     prev_hex_data: str = ''
-    prev_alarm: dict[str, AlarmCondition] = Field(default_factory=dict)
     prev_last_update: datetime = Field(default_factory=creation_time)
+    tracking_fields: dict[str, AlarmCondition | dict[str, AlarmCondition]] = Field(default_factory=dict)
 
-    def add_tmi(self, data: str, timestamp: datetime,
-                alarm_status: dict[str, AlarmCondition]):
+    def add_tmi(self, data: str, ts: datetime, notifications: list[Notification]) -> list[AlarmCondition]:
         self.prev_hex_data = self.hex_data
         self.prev_last_update = deepcopy(self.last_update)
-        self.prev_alarm = deepcopy(self.alarm)
         self.hex_data = data
-        self.alarm = alarm_status
-        self.last_update = timestamp
+        self.last_update = ts
+
+        about_to_notify: list[AlarmCondition] = []
+        for notification in notifications:
+            field = self.tracking_fields[notification.row.label]
+            if isinstance(field, AlarmCondition):
+                if field.update_data(ts, notification.row):
+                    about_to_notify.append(field)
+            else:
+                for bit in notification.bitfield:
+                    bitfield_alarm: AlarmCondition = field[bit.label]
+                    if bitfield_alarm.update_data(ts, bit):
+                        about_to_notify.append(bitfield_alarm)
+        return about_to_notify
+
+    def get_tracking_labels(self) -> list[str | tuple[str, tuple[str, ...]]]:
+        labels: list[str | tuple[str, tuple[str, ...]]] = []
+        for key, val in self.tracking_fields.items():
+            if isinstance(val, AlarmCondition):
+                labels.append(val.label)
+            else:
+                labels.append((key, tuple([(v.bitfield) for v in val.values() if v.bitfield])))
+        return labels
+
 
 class SatVault(BaseModel):
     data: dict = Field(default_factory=dict)
@@ -170,14 +151,32 @@ class SatVault(BaseModel):
     gs_name: str = ''
     username: str = ''
 
+
 class SubsystemState(BaseModel):
     dev_id: int
+    sat_id: int
     label: str
     tmi: dict[int, TMI_Status] = Field(default_factory=dict)
     last_update: datetime = Field(default_factory=creation_time)
 
     vault: SatVault = Field(default_factory=SatVault)
     prev_vault: SatVault = Field(default_factory=SatVault)
+
+    def init_tmi(self, frames_map: dict, frame_type: int, params: list[str | tuple[str, list[str]]]):
+        if not params:
+            return
+        tmi_name = frames_map[self.sat_id][self.dev_id][0][frame_type].frame_type
+        q = Qualifier(sat_id=self.sat_id, dev_id=self.dev_id, frame_type=frame_type)
+        tmi = TMI_Status(name=tmi_name, qualifier=q)
+        for param in params:
+            if isinstance(param, str):
+                tmi.tracking_fields[param] = AlarmCondition(label=param, qualifier=q)
+            else:
+                tmi.tracking_fields[param[0]] = {
+                    p: AlarmCondition(label=param[0], bitfield=p, qualifier=q)
+                    for p in param[1]
+                }
+        self.tmi[frame_type] = tmi
 
 class SatModel(BaseModel):
     label: str
@@ -191,3 +190,20 @@ class SatModel(BaseModel):
     vault: SatVault = Field(default_factory=SatVault)
     prev_vault: SatVault = Field(default_factory=SatVault)
     subsystems: dict[int, SubsystemState] = Field(default_factory=dict)
+
+    def init_dev_id_from_config(self, sat_id: int, dev_id: int | tuple[int, ...],
+                                dev_id_dict: dict[int, list[str | tuple[str, list[str]]]],
+                                frames_map: dict):
+            if isinstance(dev_id, tuple):
+                for d_id in dev_id:
+                    dev_id_label: str = frames_map[sat_id][d_id]['label']
+                    subsystem = SubsystemState(sat_id=sat_id, dev_id=d_id, label=dev_id_label)
+                    self.subsystems[d_id] = subsystem
+                    for frame_type, params in dev_id_dict.items():
+                        subsystem.init_tmi(frames_map, frame_type, params)
+            else:
+                dev_id_label: str = frames_map[sat_id][dev_id]['label']
+                subsystem = SubsystemState(sat_id=sat_id, dev_id=dev_id, label=dev_id_label)
+                self.subsystems[dev_id] = subsystem
+                for frame_type, params in dev_id_dict.items():
+                    subsystem.init_tmi(frames_map, frame_type, params)

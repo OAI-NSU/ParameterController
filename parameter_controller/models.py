@@ -2,7 +2,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from enum import Enum
 
-from bytes_parser import BitField, BitFlag, Frame, Notification, Row
+from bytes_parser import BitField, BitFlag, Frame, Row
 from pydantic import BaseModel, Field
 
 
@@ -21,7 +21,6 @@ class L0_StatusEvent(BaseModel):
     label: str
     priority: int
     created_at: datetime
-    amount_before_processed: int = 1
     processed_at: datetime | None = None
     processed_by_user: str | None = None
     user_comment: str = ''
@@ -103,30 +102,32 @@ class TMI_Status(BaseModel):
     L0_tracking_fields: dict[str, L0_TrackedField | dict[str, L0_TrackedField]] = Field(default_factory=dict)
 
     def add_tmi(self, data: str, ts: datetime,
-                notifications: list[Notification]) -> list[L0_StatusEvent]:
+                parsed_frame: Frame) -> list[L0_TrackedField]:
+        params: list[str | tuple[str, tuple[str, ...]]] = self.get_tracking_labels()
+        errors, warnings = parsed_frame.get_failed_params(params)
         self.prev_hex_data = self.hex_data
         self.prev_last_update = deepcopy(self.last_update)
         self.hex_data = data
         self.last_update = ts
 
-        about_to_notify: list[L0_StatusEvent] = []
-        for notification in notifications:
+        about_to_notify: list[L0_TrackedField] = []
+        for notification in [*errors, *warnings]:
             field = self.L0_tracking_fields[notification.row.label]
             if isinstance(field, L0_TrackedField):
-                event: None | L0_StatusEvent = field.get_ready_events(ts, notification.row)
-                if event:
+                if field.get_ready_events(ts, notification.row):
                     field.emited_at = ts
-                    about_to_notify.append(event)
+                    about_to_notify.append(field)
             else:
                 for bit in notification.bitfield:
                     bitfield_alarm: L0_TrackedField = field[bit.label]
-                    event = bitfield_alarm.get_ready_events(ts, bit)
-                    if event:
+                    if bitfield_alarm.get_ready_events(ts, bit):
                         bitfield_alarm.emited_at = ts
-                        about_to_notify.append(event)
+                        about_to_notify.append(bitfield_alarm)
+        self._update_tracked_fields_history(ts, parsed_frame)
+
         return about_to_notify
 
-    def check_tracked_fields(self, ts: datetime, parsed_frame: Frame):
+    def _update_tracked_fields_history(self, ts: datetime, parsed_frame: Frame):
         for label, field in self.L0_tracking_fields.items():
             if isinstance(field, dict):
                 for bit_label, bitfield in field.items():
@@ -196,7 +197,7 @@ class SubsystemState(BaseModel):
 
 
 class L0_Alarms(BaseModel):
-    pending: list[L0_StatusEvent] = Field(default_factory=list)
+    pending: dict[int, L0_StatusEvent] = Field(default_factory=dict)
     processed: list[L0_StatusEvent] = Field(default_factory=list)
 
 

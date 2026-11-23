@@ -6,7 +6,6 @@ from sat_frames import frames_map_0x02
 
 from parameter_controller.l0 import L0_MAP_CONFIG, L0_MAP_TYPE_ALIAS
 from parameter_controller.models import (
-    L0_StatusEvent,
     L0_TrackedField,
     Qualifier,
     SatModel,
@@ -49,6 +48,7 @@ class ParamController:
     def process_event(self, sat_id: int, dev_id: int, frame_type: int,
                       label: str, bitfield: str | None, username: str,
                       comment: str):
+        qualifier: int = (sat_id << 16) | (dev_id << 12) | frame_type
         model: SatModel = self.state[sat_id]
         fields: dict = model.subsystems[dev_id].tmi[frame_type].L0_tracking_fields
         status_or_key: L0_TrackedField | dict[str, L0_TrackedField] = fields[label]
@@ -62,7 +62,7 @@ class ParamController:
             event.status.user_comment = comment
             event.status.processed_by_user = username
             event.status.processed_at = datetime.now().astimezone()
-            model.alarms.pending.remove(event.status)
+            model.alarms.pending.pop(qualifier)
             model.alarms.processed.append(event.status)
 
     def load_config(self, l0_config: L0_MAP_TYPE_ALIAS, frames_map: dict):
@@ -125,11 +125,11 @@ class ParamController:
                           frame_type=frame_type)
             tmi = TMI_Status(qualifier=q, name=frame.frame_type)
 
-        params: list[str | tuple[str, tuple[str, ...]]] = tmi.get_tracking_labels()
-        errors, warnings = frame.get_failed_params(params)
-        about_to_notify: list[L0_StatusEvent] = tmi.add_tmi(hex_data, timestamp,
-                                                             [*errors, *warnings])
-        tmi.check_tracked_fields(timestamp, frame)
+        about_to_notify: list[L0_TrackedField] = tmi.add_tmi(hex_data, timestamp, frame)
+        qualifier: int = int.from_bytes(bytes_data[2:6], 'little')
+        for field in about_to_notify:
+            if field.status:
+                sat.alarms.pending.setdefault(qualifier, field.status)
         return about_to_notify
 
 
@@ -137,10 +137,18 @@ class ParamController:
 
 if __name__ == '__main__':
     controller = ParamController()
+    pss_tmi0 = "F1 0F 65 80 00 30 00 00 13 92 74 32 03 00 00 00 01 00 03 17 00 00 00 00 00 00 00 09 01 00 00 FE 00 00 00 90 40 A9 40 88 40 A2 40 27 00 00 00 26 00 00 00 90 40 9B 30 00 00 16 1B 00 00 FF 93 03 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 AA 2C"
+    pss_tmi0_b = bytearray.fromhex(pss_tmi0)
+    pss_tmi0_b[36] = 0
+    pss_tmi0 = pss_tmi0_b.hex(" ").upper()
     data = [
+        pss_tmi0,
         "F1 0F 65 80 02 30 00 00 13 92 74 32 03 00 15 21 FE 00 00 00 00 00 00 00 0C 07 00 00 09 00 00 C2 40 CB 40 C5 40 F6 00 D4 00 E1 00 C8 40 42 40 EB FF 46 00 E6 FF 00 00 00 00 00 00 55 01 32 00 04 00 0C 00 00 00 00 00 0C 00 00 00 00 00 00 00 F8 F7 00 00 FD FD 00 00 F4 F1 F2 F0 F5 F3 F3 F1 F3 F3 F9 F9 EA EA E6 E6 00 00 00 00 00 00 00 00 F8 FF F2 F3 F6 E8 00 00 00 00 00 00 00 00 00 B6 25",
         "F1 0F 65 80 00 30 00 00 13 92 74 32 03 00 00 00 01 00 03 17 00 00 00 00 00 00 00 09 01 00 00 FE 00 00 00 90 40 A9 40 88 40 A2 40 27 00 00 00 26 00 00 00 90 40 9B 30 00 00 16 1B 00 00 FF 93 03 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 AA 2C",
     ]
     for frame in data:
-        controller.on_received_data(frame, datetime.now(UTC), 'admin', 'NSU')
-    print(controller.state[0x65].model_dump_json(indent=4))
+        result = controller.on_received_data(frame, datetime.now(UTC), 'admin', 'NSU')
+        if result is not None:
+            for r in result:
+                print(r)
+    # print(controller.state[0x65].model_dump_json(indent=4))

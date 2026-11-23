@@ -1,82 +1,135 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
-from frames_parser import frames_map, get_frame
+from bytes_parser import Frame
+from loguru import logger
 from sat_frames import frames_map_0x02
 
-from parameter_controller.L0 import L0_MAP_CONFIG, L0_MAP_TYPE_ALIAS
+from parameter_controller.l0 import L0_MAP_CONFIG, L0_MAP_TYPE_ALIAS
 from parameter_controller.models import (
-    AlarmCondition,
+    L0_StatusEvent,
+    L0_TrackedField,
     Qualifier,
     SatModel,
     SubsystemState,
     TMI_Status,
 )
 
-frames_map[0x02].update(frames_map_0x02)
+
+def get_qualifier(raw_frame: bytes):
+    """
+    ====================================  FRAME QUALIFIER FORMAT  =====================================
+    |_________________________________________________________________________________________________|
+    |        HI Byte         |      Low Byte    |           HI Byte         |         Low Byte        |
+    |___________________ ____|__________________|___________________________|_________________________|
+    |  7  6   |  5 4 3 2 1 0   7 6 5 4 3 2 1 0  |  7  6  5  4 |  3  2  1  0 |  7  6  5  4  3  2  1  0 |
+    |_________|_________________________________|_____________|_____________|_________________________|
+    | modifier|         SAT_ID (14 bits)        |  Dev_ID     |   Flags     |        FrameType        |
+    |_________|_________________________________|_____________|_____________|_________________________|
+
+    """
+    if len(raw_frame) != 128:
+        raise ValueError(f'Incorrect frame size: {len(raw_frame)}. '\
+                         f'Must be 128')
+    order = ('big', 'little')[raw_frame.startswith(b'\xf1\x0f')]
+    sat_id = int.from_bytes(raw_frame[2:4], order ) & 0x3FFF
+    _loc_id = int.from_bytes(raw_frame[4:6], order )
+    dev_id = (_loc_id & 0xF000) >> 12
+    loc_id = _loc_id & 0x0FFF
+    flags = (loc_id & 0x0F00) >> 8
+    frame_type = loc_id & 0xFF
+    return sat_id, dev_id, flags, frame_type
 
 
 class ParamController:
     def __init__(self) -> None:
         self.state: dict[int, SatModel] = {}
-        self.load_config(L0_MAP_CONFIG, frames_map[0x02])
+        self.load_config(L0_MAP_CONFIG, frames_map_0x02)
+        self.compare_onboard_time = False
+
+    def process_event(self, sat_id: int, dev_id: int, frame_type: int,
+                      label: str, bitfield: str | None, username: str,
+                      comment: str):
+        model: SatModel = self.state[sat_id]
+        fields: dict = model.subsystems[dev_id].tmi[frame_type].L0_tracking_fields
+        status_or_key: L0_TrackedField | dict[str, L0_TrackedField] = fields[label]
+        if isinstance(status_or_key, dict) and bitfield:
+            event: L0_TrackedField = status_or_key[bitfield]
+        elif isinstance(status_or_key, L0_TrackedField) and not bitfield:
+            event = status_or_key
+        else:
+            return
+        if event.status and event.status.priority == 3:
+            event.status.user_comment = comment
+            event.status.processed_by_user = username
+            event.status.processed_at = datetime.now().astimezone()
+            model.alarms.pending.remove(event.status)
+            model.alarms.processed.append(event.status)
 
     def load_config(self, l0_config: L0_MAP_TYPE_ALIAS, frames_map: dict):
         for sat_id, sat_id_dict in l0_config.items():
             if isinstance(sat_id, tuple):
                 for s_id in sat_id:
-                    sat_state = SatModel(label=frames_map[s_id]['label'], sat_id=s_id)
+                    sat_state = SatModel(label=frames_map[s_id]['label'],
+                                         sat_id=s_id)
                     for dev_id, dev_id_dict in sat_id_dict.items():
-                        sat_state.init_dev_id_from_config(s_id, dev_id, dev_id_dict, frames_map)
+                        sat_state.init_dev_id_from_config(s_id, dev_id,
+                                                          dev_id_dict,
+                                                          frames_map)
                     self.state[s_id] = sat_state
             else:
-                sat_state = SatModel(label=frames_map[sat_id]['label'], sat_id=sat_id)
+                sat_state = SatModel(label=frames_map[sat_id]['label'],
+                                     sat_id=sat_id)
                 for dev_id, dev_id_dict in sat_id_dict.items():
-                    sat_state.init_dev_id_from_config(sat_id, dev_id, dev_id_dict, frames_map)
+                    sat_state.init_dev_id_from_config(sat_id, dev_id,
+                                                      dev_id_dict, frames_map)
                 self.state[sat_id] = sat_state
 
-    def on_received_data(self, hex_data: str, timestamp: datetime, username: str, gs_label: str):
-        frame, qualifier = get_frame(bytes.fromhex(hex_data), frames_map)
-        sat_id_val, sat_id_label = qualifier[1]
-        dev_id_val, dev_id_label = qualifier[2]
-        flag_val, _ = qualifier[3]
-        frame_type_val, frame_type_label = qualifier[4]
-        if flag_val == 1:
+    def on_received_data(self, hex_data: str, timestamp: datetime,
+                         username: str, gs_label: str):
+        bytes_data = bytes.fromhex(hex_data)
+        sat_id, dev_id, flags, frame_type = get_qualifier(bytes_data)
+        frame: Frame = frames_map_0x02[sat_id][dev_id][flags][frame_type]
+        if flags == 1:
             return
         frame.parse(hex_data)
         if not frame.rows[-1]._is_valid:
             return  # CRC16 is not valid
-        onboard_time: datetime = datetime.fromisoformat(frame['Время кадра']._repr_data)
-        if onboard_time > timestamp and (onboard_time - timestamp).seconds > 5:
-            return
-        if onboard_time < timestamp and (timestamp - onboard_time).seconds > 5:
-            return
+        onboard_time: datetime = datetime.fromisoformat(frame.rows_dict['Время кадра']._repr_data)
+        if self.compare_onboard_time:
+            if onboard_time > timestamp and (onboard_time - timestamp).seconds > 5:
+                logger.debug(f'Onboard and GS time delta: {(onboard_time - timestamp).seconds}')
+                return
+            if onboard_time < timestamp and (timestamp - onboard_time).seconds > 5:
+                logger.debug(f'Onboard and GS time delta: {(timestamp - onboard_time).seconds}')
+                return
 
-        sat: SatModel | None = self.state.get(sat_id_val)
+        sat: SatModel | None = self.state.get(sat_id)
         if not sat:
-            sat = SatModel(label=sat_id_label, sat_id=sat_id_val)
-            self.state[sat_id_val] = sat
+            sat = SatModel(label=frames_map_0x02[sat_id]['label'],
+                           sat_id=sat_id)
+            self.state[sat_id] = sat
 
         sat.last_user = username
         sat.last_gs = gs_label
         sat.last_session = timestamp
 
-        subsystem: SubsystemState | None = sat.subsystems.get(dev_id_val)
+        subsystem: SubsystemState | None = sat.subsystems.get(dev_id)
         if not subsystem:
-            subsystem = SubsystemState(sat_id=sat_id_val, dev_id=dev_id_val,
-                                       label=dev_id_label)
+            subsystem = SubsystemState(sat_id=sat_id, dev_id=dev_id,
+                                       label=frames_map_0x02[sat_id][dev_id]['label'])
         subsystem.last_update = timestamp
 
-        tmi: TMI_Status | None = subsystem.tmi.get(frame_type_val)
+        tmi: TMI_Status | None = subsystem.tmi.get(frame_type)
         if not tmi:
-            q = Qualifier(sat_id=sat_id_val, dev_id=dev_id_val,
-                          frame_type=frame_type_val)
-            tmi = TMI_Status(qualifier=q, name=frame_type_label)
+            q = Qualifier(sat_id=sat_id, dev_id=dev_id,
+                          frame_type=frame_type)
+            tmi = TMI_Status(qualifier=q, name=frame.frame_type)
 
         params: list[str | tuple[str, tuple[str, ...]]] = tmi.get_tracking_labels()
         errors, warnings = frame.get_failed_params(params)
-        about_to_notify: list[AlarmCondition] = tmi.add_tmi(hex_data,
-                                                            timestamp,
-                                                            [*errors, *warnings])
+        about_to_notify: list[L0_StatusEvent] = tmi.add_tmi(hex_data, timestamp,
+                                                             [*errors, *warnings])
+        tmi.check_tracked_fields(timestamp, frame)
         return about_to_notify
 
 
@@ -84,4 +137,10 @@ class ParamController:
 
 if __name__ == '__main__':
     controller = ParamController()
+    data = [
+        "F1 0F 65 80 02 30 00 00 13 92 74 32 03 00 15 21 FE 00 00 00 00 00 00 00 0C 07 00 00 09 00 00 C2 40 CB 40 C5 40 F6 00 D4 00 E1 00 C8 40 42 40 EB FF 46 00 E6 FF 00 00 00 00 00 00 55 01 32 00 04 00 0C 00 00 00 00 00 0C 00 00 00 00 00 00 00 F8 F7 00 00 FD FD 00 00 F4 F1 F2 F0 F5 F3 F3 F1 F3 F3 F9 F9 EA EA E6 E6 00 00 00 00 00 00 00 00 F8 FF F2 F3 F6 E8 00 00 00 00 00 00 00 00 00 B6 25",
+        "F1 0F 65 80 00 30 00 00 13 92 74 32 03 00 00 00 01 00 03 17 00 00 00 00 00 00 00 09 01 00 00 FE 00 00 00 90 40 A9 40 88 40 A2 40 27 00 00 00 26 00 00 00 90 40 9B 30 00 00 16 1B 00 00 FF 93 03 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 AA 2C",
+    ]
+    for frame in data:
+        controller.on_received_data(frame, datetime.now(UTC), 'admin', 'NSU')
     print(controller.state[0x65].model_dump_json(indent=4))

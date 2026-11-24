@@ -57,6 +57,8 @@ class ParamController:
         elif isinstance(status_or_key, L0_TrackedField) and not bitfield:
             event = status_or_key
         else:
+            logger.debug(f'Event not found for {label} {bitfield} '\
+                         f'({sat_id}, {dev_id}, {frame_type}) tracked field')
             return
         if event.status and event.status.priority == 3:
             event.status.user_comment = comment
@@ -85,23 +87,25 @@ class ParamController:
                 self.state[sat_id] = sat_state
 
     def on_received_data(self, hex_data: str, timestamp: datetime,
-                         username: str, gs_label: str):
+                         username: str, gs_label: str) -> list[L0_TrackedField]:
         bytes_data = bytes.fromhex(hex_data)
         sat_id, dev_id, flags, frame_type = get_qualifier(bytes_data)
         frame: Frame = frames_map_0x02[sat_id][dev_id][flags][frame_type]
         if flags == 1:
-            return
+            logger.debug(f'Frame has incorrect flag: {hex_data}')
+            return []
         frame.parse(hex_data)
         if not frame.rows[-1]._is_valid:
-            return  # CRC16 is not valid
+            logger.debug(f'Frame has invalid CRC: {hex_data}')
+            return []  # CRC16 is not valid
         onboard_time: datetime = datetime.fromisoformat(frame.rows_dict['Время кадра']._repr_data)
         if self.compare_onboard_time:
             if onboard_time > timestamp and (onboard_time - timestamp).seconds > 5:
                 logger.debug(f'Onboard and GS time delta: {(onboard_time - timestamp).seconds}')
-                return
+                return []
             if onboard_time < timestamp and (timestamp - onboard_time).seconds > 5:
                 logger.debug(f'Onboard and GS time delta: {(timestamp - onboard_time).seconds}')
-                return
+                return []
 
         sat: SatModel | None = self.state.get(sat_id)
         if not sat:
@@ -128,7 +132,7 @@ class ParamController:
         about_to_notify: list[L0_TrackedField] = tmi.add_tmi(hex_data, timestamp, frame)
         qualifier: int = int.from_bytes(bytes_data[2:6], 'little')
         for field in about_to_notify:
-            if field.status:
+            if field.status and field.status.priority == 3:
                 sat.alarms.pending.setdefault(qualifier, field.status)
         return about_to_notify
 
@@ -148,7 +152,6 @@ if __name__ == '__main__':
     ]
     for frame in data:
         result = controller.on_received_data(frame, datetime.now(UTC), 'admin', 'NSU')
-        if result is not None:
-            for r in result:
-                print(r)
+        for r in result:
+            print(r)
     # print(controller.state[0x65].model_dump_json(indent=4))

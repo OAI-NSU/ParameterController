@@ -1,11 +1,12 @@
 import asyncio
 import os
+from copy import copy
 from datetime import datetime
 from typing import Generic, TypeVar
 from uuid import UUID, uuid4
 
 from beanie import Document, init_beanie
-from bytes_parser import Frame, Row
+from bytes_parser import Frame, Notification
 from dotenv import load_dotenv
 from loguru import logger
 from pydantic import Field
@@ -13,7 +14,7 @@ from pymongo import AsyncMongoClient
 from sat_frames import frames_map_0x02
 
 from parameter_controller.L0.config import get_qualifier, load_config, nested_dict
-from parameter_controller.L0.models import L0_History, L0_Parameter
+from parameter_controller.L0.models import L0_History, L0_Parameter, L0_StatusEvent
 
 
 class L0_ParameterDoc(L0_Parameter, Document):
@@ -54,18 +55,19 @@ class DB_ParamController:
         await self.load_config()
 
     async def load_config(self):
-        for param in load_config(L0_ParameterDoc, frames_map_0x02, self.params_dict):
+        for param in load_config(frames_map_0x02, self.params_dict):
+            model = L0_ParameterDoc(**param)
             filter: dict = {
-                'sat_id': param.sat_id,
-                'dev_id': param.dev_id,
-                'frame_type': param.frame_type,
-                'field_label': param.field_label
+                'sat_id': model.sat_id,
+                'dev_id': model.dev_id,
+                'frame_type': model.frame_type,
+                'field_label': model.field_label
             }
-            if param.bitfield:
-                filter['bitfield'] = param.bitfield
+            if model.bitfield:
+                filter['bitfield'] = model.bitfield
 
             if not await self.params.count_documents(filter):
-                await L0_ParameterDoc.insert_one(param)
+                await L0_ParameterDoc.insert_one(model)
 
 
     async def on_received_data(self, hex_data: str, timestamp: datetime,
@@ -90,28 +92,43 @@ class DB_ParamController:
                 return []
         params = self.params_dict[sat_id][dev_id][frame_type]
         errors, warnings = frame.get_failed_params(params)
-        field_label = params
         filter: dict = {
             'sat_id': sat_id,
             'dev_id': dev_id,
             'frame_type': frame_type,
+            'bitfield': None
         }
-        async for model in self.params.find(filter):
-            model.last_user = username
-            model.last_gs = gs_label
-            model.last_session = timestamp
-            model.raw
+        notifications: list[Notification] = [*errors, *warnings]
+        about_to_notify = []
+        async for model, n in self.process_notifications(notifications, filter):
+            model.prev_level = model.level
+            if not model.status:
+                level_lavel
+                model.status = L0_StatusEvent()
 
+            # model.prev_hex_data = model.hex_data
+            # model.prev_last_update = model.last_update
+            # model.last_user = username
+            # model.last_gs = gs_label
+            # model.last_update = timestamp
+            # model.hex_data = hex_data
+            # model.onboard_time = onboard_time
+            await model.save()
 
-        about_to_notify: list[L0_TrackedField] = tmi.add_tmi(hex_data, timestamp, frame)
-        tmi.update_tracked_fields_history(timestamp, frame)
-        qualifier: int = int.from_bytes(bytes_data[2:6], 'little')
-        for field in about_to_notify:
-            if field.status and field.status.priority == 3:
-                sat.alarms.pending.setdefault(qualifier, field.status)
-        return about_to_notify
-
-
+    async def process_notifications(self, notifications: list[Notification], filter: dict):
+        for n in notifications:
+            new_filter = copy(filter)
+            new_filter['field_label'] = n.row.label
+            if n.bitfield:
+                for bit in n.bitfield:
+                    new_filter['bitfield'] = bit.label
+                    model_dict = await self.params.find_one(new_filter)
+                    if model_dict:
+                        yield L0_ParameterDoc.model_validate(model_dict), n
+            else:
+                model_dict = await self.params.find_one(new_filter)
+                if model_dict:
+                    yield L0_ParameterDoc.model_validate(model_dict), n
 
 async def db_test():
     controller = DB_ParamController()

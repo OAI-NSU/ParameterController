@@ -27,28 +27,29 @@ class L0_StatusEvent(BaseModel):
     max_val: float | int | bool | None = None
 
 
-class L0_Parameter(BaseModel):
+class L0_Header(BaseModel):
     sat_label: str
     dev_label: str
     frame_label: str
     field_label: str
     bitfield: str | None = None
-
     sat_id: int
     dev_id: int
     frame_type: int
 
-    last_user: str = ''
-    last_gs: str = ''
 
-    onboard_time: datetime = Field(default_factory=creation_time)
+class L0_Parameter(L0_Header):
+    # last_user: str = ''
+    # last_gs: str = ''
 
-    hex_data: str = ''
-    last_update: datetime = Field(default_factory=creation_time)
-    prev_hex_data: str = ''
-    prev_last_update: datetime = Field(default_factory=creation_time)
+    # onboard_time: datetime = Field(default_factory=creation_time)
 
-    alarm: L0_StatusEvent | None = None
+    # hex_data: str = ''
+    # last_update: datetime = Field(default_factory=creation_time)
+    # prev_hex_data: str = ''
+    # prev_last_update: datetime = Field(default_factory=creation_time)
+
+    status: L0_StatusEvent | None = None
     alarm_status: bool = False
 
     level: int = EventLevel.Normalized.value
@@ -57,19 +58,9 @@ class L0_Parameter(BaseModel):
     relaxation_time: int = 1000
     emited_at: datetime | None = None
 
-    status: L0_StatusEvent | None = None
 
 
-class L0_History(BaseModel):
-    sat_label: str
-    dev_label: str
-    frame_label: str
-    field_label: str
-    bitfield: str | None = None
 
-    sat_id: int
-    dev_id: int
-    frame_type: int
-
+class L0_History(L0_Header):
     alarm_history: list[L0_StatusEvent] = Field(default_factory=list)
     history: list[tuple[datetime, int]] = Field(default_factory=list)

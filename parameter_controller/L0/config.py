@@ -45,7 +45,7 @@ L0_MAP_CONFIG: L0_MAP_TYPE_ALIAS = {
 #                     return L0_MAP_CONFIG[sat_id_key][dev_id_key][frame_type]
 #     return []
 
-def iterate_tmi(model: type, sat_id: int, dev_id: int, frame_type: int,
+def iterate_tmi(sat_id: int, dev_id: int, frame_type: int,
                 frames_map: dict, params: list[str | tuple[str, list[str]]],
                 params_map: defaultdict):
     if not params:
@@ -54,49 +54,48 @@ def iterate_tmi(model: type, sat_id: int, dev_id: int, frame_type: int,
     sat_label: str = frames_map[sat_id]['label']
     dev_id_label: str = frames_map[sat_id][dev_id]['label']
     params_map[sat_id][dev_id][frame_type] = params
+    data: dict = {
+        "sat_label": sat_label,
+        "dev_label": dev_id_label,
+        "frame_label": tmi_name,
+        "sat_id": sat_id,
+        "dev_id": dev_id,
+        "frame_type": frame_type
+    }
     for param in params:
+        tmp: dict = data.copy()
         if isinstance(param, str):
-            yield model(sat_label=sat_label,
-                        dev_label=dev_id_label,
-                        frame_label=tmi_name,
-                        field_label=param,
-                        sat_id=sat_id,
-                        dev_id=dev_id,
-                        frame_type=frame_type)
+            tmp["field_label"] = param
+            yield tmp
         else:
             for p in param[1]:
-                yield model(sat_label=sat_label,
-                            dev_label=dev_id_label,
-                            frame_label=tmi_name,
-                            field_label=param[0],
-                            bitfield=p,
-                            sat_id=sat_id,
-                            dev_id=dev_id,
-                            frame_type=frame_type)
+                tmp["field_label"] = param[0]
+                tmp["bitfield"] = p
+                yield tmp
 
-def iterate_dev_id(model: type, sat_id: int, dev_id: int | tuple[int, ...],
+def iterate_dev_id(sat_id: int, dev_id: int | tuple[int, ...],
                    dev_id_dict: dict[int, list[str | tuple[str, list[str]]]],
                    frames_map: dict, params_map: defaultdict):
     if isinstance(dev_id, tuple):
         for d_id in dev_id:
             for frame_type, params in dev_id_dict.items():
-                yield from iterate_tmi(model, sat_id, d_id, frame_type,
+                yield from iterate_tmi(sat_id, d_id, frame_type,
                                        frames_map, params, params_map)
     else:
         for frame_type, params in dev_id_dict.items():
-            yield from iterate_tmi(model, sat_id, dev_id, frame_type,
+            yield from iterate_tmi(sat_id, dev_id, frame_type,
                                    frames_map, params, params_map)
 
-def load_config(model: type, frames_map: dict, params_map: defaultdict):
+def load_config(frames_map: dict, params_map: defaultdict):
     for sat_id, sat_id_dict in L0_MAP_CONFIG.items():
         if isinstance(sat_id, tuple):
             for s_id in sat_id:
                 for dev_id, dev_id_dict in sat_id_dict.items():
-                    yield from iterate_dev_id(model, s_id, dev_id, dev_id_dict,
+                    yield from iterate_dev_id(s_id, dev_id, dev_id_dict,
                                               frames_map, params_map)
         else:
             for dev_id, dev_id_dict in sat_id_dict.items():
-                yield from iterate_dev_id(model, sat_id, dev_id, dev_id_dict,
+                yield from iterate_dev_id(sat_id, dev_id, dev_id_dict,
                                           frames_map, params_map)
 
 def get_qualifier(raw_frame: bytes):

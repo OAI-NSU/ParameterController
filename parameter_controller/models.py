@@ -123,11 +123,10 @@ class TMI_Status(BaseModel):
                     if bitfield_alarm.get_ready_events(ts, bit):
                         bitfield_alarm.emited_at = ts
                         about_to_notify.append(bitfield_alarm)
-        self._update_tracked_fields_history(ts, parsed_frame)
 
         return about_to_notify
 
-    def _update_tracked_fields_history(self, ts: datetime, parsed_frame: Frame):
+    def update_tracked_fields_history(self, ts: datetime, parsed_frame: Frame):
         for label, field in self.L0_tracking_fields.items():
             if isinstance(field, dict):
                 for bit_label, bitfield in field.items():
@@ -220,18 +219,18 @@ class SatModel(BaseModel):
     def init_dev_id_from_config(self, sat_id: int, dev_id: int | tuple[int, ...],
                                 dev_id_dict: dict[int, list[str | tuple[str, list[str]]]],
                                 frames_map: dict):
-            if isinstance(dev_id, tuple):
-                for d_id in dev_id:
-                    dev_id_label: str = frames_map[sat_id][d_id]['label']
-                    subsystem = SubsystemState(sat_id=sat_id, dev_id=d_id,
-                                               label=dev_id_label)
-                    self.subsystems[d_id] = subsystem
-                    for frame_type, params in dev_id_dict.items():
-                        subsystem.init_tmi(frames_map, frame_type, params)
-            else:
-                dev_id_label: str = frames_map[sat_id][dev_id]['label']
-                subsystem = SubsystemState(sat_id=sat_id, dev_id=dev_id,
-                                           label=dev_id_label)
-                self.subsystems[dev_id] = subsystem
+        if isinstance(dev_id, tuple):
+            for d_id in dev_id:
+                dev_id_label: str = frames_map[sat_id][d_id]['label']
+                subsystem = SubsystemState(sat_id=sat_id, dev_id=d_id,
+                                            label=dev_id_label)
+                self.subsystems[d_id] = subsystem
                 for frame_type, params in dev_id_dict.items():
                     subsystem.init_tmi(frames_map, frame_type, params)
+        else:
+            dev_id_label: str = frames_map[sat_id][dev_id]['label']
+            subsystem = SubsystemState(sat_id=sat_id, dev_id=dev_id,
+                                        label=dev_id_label)
+            self.subsystems[dev_id] = subsystem
+            for frame_type, params in dev_id_dict.items():
+                subsystem.init_tmi(frames_map, frame_type, params)

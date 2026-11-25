@@ -6,7 +6,7 @@ from typing import Generic, TypeVar
 from uuid import UUID, uuid4
 
 from beanie import Document, init_beanie
-from bytes_parser import Frame, Notification
+from bytes_parser import BitField, BitFlag, Frame, Notification, Row
 from dotenv import load_dotenv
 from loguru import logger
 from pydantic import Field
@@ -14,8 +14,38 @@ from pymongo import AsyncMongoClient
 from sat_frames import frames_map_0x02
 
 from parameter_controller.L0.config import get_qualifier, load_config, nested_dict
-from parameter_controller.L0.models import L0_History, L0_Parameter, L0_StatusEvent
+from parameter_controller.L0.models import (
+    EventLevel,
+    L0_History,
+    L0_Parameter,
+    L0_StatusEvent,
+)
 
+
+def create_status(ts: datetime, field: Row | BitField | BitFlag):
+    min_val: int | float | None = None
+    max_val: int | float | None = None
+    if isinstance(field, Row):
+        value: int | float = field._parsed_val
+        is_error: bool = not field._is_valid
+        is_warning: bool = field._is_warn
+        if is_error:
+            min_val = field.min_value
+            max_val = field.max_value
+        elif is_warning:
+            min_val = field.warn_min_value
+            max_val = field.warn_max_value
+    else:
+        value = field._value
+        is_error = not field.is_valid
+        is_warning = False
+        if isinstance(field, BitField) and is_error:
+            min_val = field.min_value
+            max_val = field.max_value
+    level: EventLevel = EventLevel.Error if is_error else EventLevel.Warning
+    return L0_StatusEvent(label=level.name, priority=level.value,
+                          created_at=ts, min_val=min_val,
+                          max_val=max_val, value=value)
 
 class L0_ParameterDoc(L0_Parameter, Document):
     id: UUID = Field(default_factory=uuid4, alias='_id')  # pyright: ignore[reportIncompatibleVariableOverride]
@@ -48,6 +78,7 @@ class DB_ParamController:
         self.history = self.db['L0_HistoryDoc']
         self.compare_onboard_time = False
         self.params_dict = nested_dict()
+        self.relaxation_time = 1000
 
     async def init_db(self):
         await init_beanie(database=self.db,
@@ -100,22 +131,41 @@ class DB_ParamController:
         }
         notifications: list[Notification] = [*errors, *warnings]
         about_to_notify = []
-        async for model, n in self.process_notifications(notifications, filter):
+        async for model, n in self.request_params(notifications, filter):
+            if not model.bitfield:
+                field = n.row
+            else:
+                field = n.row._bit_fields_kwarg[model.bitfield]
+            new_status: L0_StatusEvent = create_status(timestamp, field)
             model.prev_level = model.level
-            if not model.status:
-                level_lavel
-                model.status = L0_StatusEvent()
-
-            # model.prev_hex_data = model.hex_data
-            # model.prev_last_update = model.last_update
-            # model.last_user = username
-            # model.last_gs = gs_label
-            # model.last_update = timestamp
-            # model.hex_data = hex_data
-            # model.onboard_time = onboard_time
+            model.level = new_status.priority
+            if model.update_status(new_status, self.relaxation_time):
+                about_to_notify.append(model)
             await model.save()
 
-    async def process_notifications(self, notifications: list[Notification], filter: dict):
+    async def update_tracked_fields_history(self, ts: datetime, parsed_frame: Frame):
+        for label, field in self.L0_tracking_fields.items():
+            if isinstance(field, dict):
+                for bit_label, bitfield in field.items():
+                    bitfield.prev_level = bitfield.level
+                    bit = parsed_frame.rows_dict[label]._bit_fields_kwarg[bit_label]
+                    if not bit.is_valid:
+                        bitfield.level = 3
+                    else:
+                        bitfield.level = 0
+            else:
+                field.prev_level = field.level
+                row: Row = parsed_frame.rows_dict[label]
+                if not row._is_valid:
+                    field.level = 3
+                elif row._is_warn:
+                    field.level = 2
+                else:
+                    field.level = 0
+                if field.prev_level != field.level:
+                    field.history.append((ts, field.level))
+
+    async def request_params(self, notifications: list[Notification], filter: dict):
         for n in notifications:
             new_filter = copy(filter)
             new_filter['field_label'] = n.row.label

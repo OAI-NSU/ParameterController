@@ -55,10 +55,25 @@ class L0_Parameter(L0_Header):
     level: int = EventLevel.Normalized.value
     prev_level: int = EventLevel.Normalized.value
 
-    relaxation_time: int = 1000
     emited_at: datetime | None = None
 
+    def update_status(self, new_status: L0_StatusEvent,
+                      relaxation_time: int) -> bool:
+        if not self.status:
+            self.status = new_status
+            return True
+        else:
+            if self.status.priority < self.level:
+                self.status = new_status
+                return True
+            elif self.status.priority == self.level and self.is_ready_to_emit(relaxation_time):
+                return True
+            return False
 
+    def is_ready_to_emit(self, relaxation_time: int) -> bool:
+        if self.emited_at:
+            return (datetime.now(UTC) - self.emited_at).seconds > relaxation_time
+        return True
 
 
 class L0_History(L0_Header):

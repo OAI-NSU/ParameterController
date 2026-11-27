@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from enum import Enum
 
+from bytes_parser import BitField, BitFlag, Row
 from pydantic import BaseModel, Field
 
 
@@ -15,60 +16,39 @@ class EventLevel(Enum):
     Error = 3
 
 
-class L0_StatusEvent(BaseModel):
-    label: str
-    priority: int
+class PendingEvent(BaseModel):
     created_at: datetime
-    processed_at: datetime | None = None
-    processed_by_user: str | None = None
-    user_comment: str = ''
     value: float | int | bool
     min_val: float | int | bool | None = None
     max_val: float | int | bool | None = None
 
 
-class L0_Header(BaseModel):
-    sat_label: str
-    dev_label: str
-    frame_label: str
-    field_label: str
-    bitfield: str | None = None
+class ProcessedEvent(PendingEvent):
+    processed_at: datetime | None = None
+    processed_by_user: str | None = None
+    user_comment: str = ''
+
+
+class Qualifier(BaseModel):
     sat_id: int
     dev_id: int
     frame_type: int
+    sat_label: str
+    dev_label: str
+    frame_label: str
 
 
-class L0_Parameter(L0_Header):
-    # last_user: str = ''
-    # last_gs: str = ''
+class ParamHeader(Qualifier):
+    field_label: str
+    bitfield: str | None = None
 
-    # onboard_time: datetime = Field(default_factory=creation_time)
 
-    # hex_data: str = ''
-    # last_update: datetime = Field(default_factory=creation_time)
-    # prev_hex_data: str = ''
-    # prev_last_update: datetime = Field(default_factory=creation_time)
-
-    status: L0_StatusEvent | None = None
-    alarm_status: bool = False
-
+class Parameter(ParamHeader):
     level: int = EventLevel.Normalized.value
     prev_level: int = EventLevel.Normalized.value
 
     emited_at: datetime | None = None
-
-    def update_status(self, new_status: L0_StatusEvent,
-                      relaxation_time: int) -> bool:
-        if not self.status:
-            self.status = new_status
-            return True
-        else:
-            if self.status.priority < self.level:
-                self.status = new_status
-                return True
-            elif self.status.priority == self.level and self.is_ready_to_emit(relaxation_time):
-                return True
-            return False
+    emited_level: int = EventLevel.Normalized.value
 
     def is_ready_to_emit(self, relaxation_time: int) -> bool:
         if self.emited_at:
@@ -76,6 +56,35 @@ class L0_Parameter(L0_Header):
         return True
 
 
-class L0_History(L0_Header):
-    alarm_history: list[L0_StatusEvent] = Field(default_factory=list)
+class History(ParamHeader):
+    alarm_history: list[ProcessedEvent] = Field(default_factory=list)
     history: list[tuple[datetime, int]] = Field(default_factory=list)
+
+
+class TMI_State(Qualifier):
+    hex_data: str = ''
+    last_update: datetime = Field(default_factory=creation_time)
+
+
+def create_status(ts: datetime, field: Row | BitField | BitFlag):
+    min_val: int | float | None = None
+    max_val: int | float | None = None
+    if isinstance(field, Row):
+        value: int | float = field._parsed_val
+        is_error: bool = not field._is_valid
+        is_warning: bool = field._is_warn
+        if is_error:
+            min_val = field.min_value
+            max_val = field.max_value
+        elif is_warning:
+            min_val = field.warn_min_value
+            max_val = field.warn_max_value
+    else:
+        value = field._value
+        is_error = not field.is_valid
+        is_warning = False
+        if isinstance(field, BitField) and is_error:
+            min_val = field.min_value
+            max_val = field.max_value
+    return ProcessedEvent(created_at=ts, min_val=min_val,
+                          max_val=max_val, value=value)

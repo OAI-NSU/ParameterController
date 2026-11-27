@@ -2,92 +2,40 @@ import asyncio
 import os
 from copy import copy
 from datetime import datetime
-from typing import Generic, TypeVar
-from uuid import UUID, uuid4
 
-from beanie import Document, init_beanie
-from bytes_parser import BitField, BitFlag, Frame, Notification, Row
+from beanie import init_beanie
+from bytes_parser import Frame, Notification, Row, BitFlag, BitField
 from dotenv import load_dotenv
 from loguru import logger
-from pydantic import Field
 from pymongo import AsyncMongoClient
 from sat_frames import frames_map_0x02
 
 from parameter_controller.L0.config import get_qualifier, load_config, nested_dict
-from parameter_controller.L0.models import (
-    EventLevel,
-    L0_History,
-    L0_Parameter,
-    L0_StatusEvent,
-)
-
-
-def create_status(ts: datetime, field: Row | BitField | BitFlag):
-    min_val: int | float | None = None
-    max_val: int | float | None = None
-    if isinstance(field, Row):
-        value: int | float = field._parsed_val
-        is_error: bool = not field._is_valid
-        is_warning: bool = field._is_warn
-        if is_error:
-            min_val = field.min_value
-            max_val = field.max_value
-        elif is_warning:
-            min_val = field.warn_min_value
-            max_val = field.warn_max_value
-    else:
-        value = field._value
-        is_error = not field.is_valid
-        is_warning = False
-        if isinstance(field, BitField) and is_error:
-            min_val = field.min_value
-            max_val = field.max_value
-    level: EventLevel = EventLevel.Error if is_error else EventLevel.Warning
-    return L0_StatusEvent(label=level.name, priority=level.value,
-                          created_at=ts, min_val=min_val,
-                          max_val=max_val, value=value)
-
-class L0_ParameterDoc(L0_Parameter, Document):
-    id: UUID = Field(default_factory=uuid4, alias='_id')  # pyright: ignore[reportIncompatibleVariableOverride]
-
-
-class L0_HistoryDoc(L0_History, Document):
-    id: UUID = Field(default_factory=uuid4, alias='_id')  # pyright: ignore[reportIncompatibleVariableOverride]
-
-
-L0_PARAM_BEANIE = TypeVar("L0_PARAM_BEANIE", bound=L0_ParameterDoc)
-L0_HISTORY_BEANIE = TypeVar("L0_HISTORY_BEANIE", bound=L0_HistoryDoc)
-
-
-class L0_DB(Generic[L0_PARAM_BEANIE]):
-    def __init__(self, model: type[L0_PARAM_BEANIE]):
-        self.model: type[L0_PARAM_BEANIE] = model
-
-
-class L0_HistoryDB(Generic[L0_HISTORY_BEANIE]):
-    def __init__(self, model: type[L0_HISTORY_BEANIE]):
-        self.model: type[L0_HISTORY_BEANIE] = model
+from parameter_controller.L0.db_documents import HistoryDoc, ParameterDoc, TMI_StateDoc
+from parameter_controller.L0.models import EventLevel
 
 
 class DB_ParamController:
     def __init__(self) -> None:
         load_dotenv()
         self.client = AsyncMongoClient(os.environ['DATABASE_URL'])
-        self.db = self.client[os.environ['DB_NAME']]
-        self.params = self.db['L0_ParameterDoc']
-        self.history = self.db['L0_HistoryDoc']
+        self.db = self.client['L0']
+        self.params = self.db['ParameterDoc']
+        self.history = self.db['HistoryDoc']
+        self.pending = self.db['PendingDoc']
+        self.tmi = self.db['TMI_StateDoc']
         self.compare_onboard_time = False
         self.params_dict = nested_dict()
         self.relaxation_time = 1000
 
     async def init_db(self):
         await init_beanie(database=self.db,
-                          document_models=[L0_ParameterDoc, L0_HistoryDoc])
+                          document_models=[ParameterDoc, HistoryDoc])
         await self.load_config()
 
     async def load_config(self):
         for param in load_config(frames_map_0x02, self.params_dict):
-            model = L0_ParameterDoc(**param)
+            model = ParameterDoc(**param)
             filter: dict = {
                 'sat_id': model.sat_id,
                 'dev_id': model.dev_id,
@@ -98,11 +46,10 @@ class DB_ParamController:
                 filter['bitfield'] = model.bitfield
 
             if not await self.params.count_documents(filter):
-                await L0_ParameterDoc.insert_one(model)
+                await ParameterDoc.insert_one(model)
 
 
-    async def on_received_data(self, hex_data: str, timestamp: datetime,
-                               username: str, gs_label: str):
+    async def on_received_data(self, hex_data: str, timestamp: datetime):
         bytes_data: bytes = bytes.fromhex(hex_data)
         sat_id, dev_id, flags, frame_type = get_qualifier(bytes_data)
         frame: Frame = frames_map_0x02[sat_id][dev_id][flags][frame_type]
@@ -121,27 +68,36 @@ class DB_ParamController:
             if onboard_time < timestamp and (timestamp - onboard_time).seconds > 5:
                 logger.debug(f'Onboard and GS time delta: {(timestamp - onboard_time).seconds}')
                 return []
-        params = self.params_dict[sat_id][dev_id][frame_type]
-        errors, warnings = frame.get_failed_params(params)
         filter: dict = {
             'sat_id': sat_id,
             'dev_id': dev_id,
             'frame_type': frame_type,
-            'bitfield': None
         }
+        model_dict = await self.tmi.find_one(filter)
+        if model_dict:
+            model = TMI_StateDoc.model_validate(model_dict)
+            model.hex_data = hex_data
+            model.last_update = timestamp
+            await model.save()
+
+        params = self.params_dict[sat_id][dev_id][frame_type]
+        errors, warnings = frame.get_failed_params(params)
         notifications: list[Notification] = [*errors, *warnings]
-        about_to_notify = []
+        about_to_notify: list[ParameterDoc] = []
+        await self.pending.find(filter).to_list()
+
         async for model, n in self.request_params(notifications, filter):
             if not model.bitfield:
                 field = n.row
             else:
                 field = n.row._bit_fields_kwarg[model.bitfield]
-            new_status: L0_StatusEvent = create_status(timestamp, field)
             model.prev_level = model.level
-            model.level = new_status.priority
-            if model.update_status(new_status, self.relaxation_time):
-                about_to_notify.append(model)
+            model.level = get_level(field)
+            if model.level > model.prev_level:
+
             await model.save()
+
+
 
     async def update_tracked_fields_history(self, ts: datetime, parsed_frame: Frame):
         for label, field in self.L0_tracking_fields.items():
@@ -174,11 +130,22 @@ class DB_ParamController:
                     new_filter['bitfield'] = bit.label
                     model_dict = await self.params.find_one(new_filter)
                     if model_dict:
-                        yield L0_ParameterDoc.model_validate(model_dict), n
+                        yield ParameterDoc.model_validate(model_dict), n
             else:
                 model_dict = await self.params.find_one(new_filter)
                 if model_dict:
-                    yield L0_ParameterDoc.model_validate(model_dict), n
+                    yield ParameterDoc.model_validate(model_dict), n
+
+def get_level(field: Row | BitFlag | BitField) -> int:
+    if isinstance(field, Row):
+        if not field._is_valid:
+            return EventLevel.Error.value
+        if field._is_warn:
+            return EventLevel.Warning.value
+        return EventLevel.Normalized.value
+    if not field.is_valid:
+        return EventLevel.Error.value
+    return EventLevel.Normalized.value
 
 async def db_test():
     controller = DB_ParamController()
